@@ -156,6 +156,13 @@ Packages fail to install from time to time -- this is normal. The most common re
 6. Old tool URL (e.g., `HTTP STATUS 404`)
 7. Tool's SHA256 hash has changed from what is hardcoded in the package installation script
 
+> **Note on MyGet reliability:** this fork installs `.vm` packages from a locally pre-built
+> snapshot first (extracted to `vm-packages-local` on the Desktop), built directly from
+> [mandiant/VM-Packages](https://github.com/mandiant/VM-Packages) source and refreshed
+> periodically by [`build-vm-packages.yml`](.github/workflows/build-vm-packages.yml) in this
+> repo, so most installs no longer depend on myget.org. MyGet remains a fallback source for
+> any package not yet present in the snapshot (e.g. one added upstream very recently).
+
 Reasons **1-4** are difficult for us to fix since we do not control them. If an issue related to reasons **1-4** is filed, it is unlikely we will be able to assist.
 
 We can help with reasons **5-7** and welcome the community to contribute fixes as well!

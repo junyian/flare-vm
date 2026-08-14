@@ -1,0 +1,86 @@
+name: Build vm-packages snapshot
+# Builds the .vm Chocolatey wrapper packages directly from mandiant/VM-Packages source
+# (via `choco pack`, no myget involved) and republishes them as a fixed-tag GitHub
+# Release asset in this repo, so install.ps1 can install from a local snapshot first
+# and only fall back to myget.org when a package isn't in the snapshot yet.
+#
+# Builds from the newest commit on VM-Packages' main branch whose own CI ("Test &
+# Push") succeeded, since that workflow only pushes to myget after packages pass
+# install testing - building bare HEAD could snapshot a commit myget itself withheld.
+
+on:
+  workflow_dispatch: # manual trigger, also used for the first snapshot
+  schedule:
+    - cron: '0 6 * * *' # daily; note: disabled by default on forks until Actions/schedule is enabled
+
+permissions:
+  contents: write
+
+env:
+  SNAPSHOT_TAG: vm-packages-snapshot
+  VM_PACKAGES_REPO: mandiant/VM-Packages
+
+jobs:
+  build:
+    # Pinned (not windows-latest) to match the runner mandiant/VM-Packages builds its
+    # own myget artifacts on (see their ci.yml), since we're substituting for that build
+    runs-on: windows-2022
+    steps:
+      - name: Resolve last known-good VM-Packages commit
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          sha=$(gh run list --repo "$VM_PACKAGES_REPO" --workflow=ci.yml --branch=main --status=success --limit=1 --json headSha --jq '.[0].headSha')
+          if [ -z "$sha" ]; then
+            echo "::error::Could not resolve a known-good VM-Packages commit; refusing to build from unchecked HEAD" >&2
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout VM-Packages
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ env.VM_PACKAGES_REPO }}
+          ref: ${{ steps.resolve.outputs.sha }}
+          path: VM-Packages
+
+      - name: Pack all packages
+        shell: pwsh
+        run: |
+          $builtPkgsDir = New-Item -ItemType Directory -Force -Path built_pkgs
+          $packageDirs = Get-ChildItem -Path VM-Packages/packages -Directory
+          foreach ($packageDir in $packageDirs) {
+            Push-Location $packageDir.FullName
+            choco pack -y -out $builtPkgsDir.FullName
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "##[warning] Failed to pack $($packageDir.Name), skipping"
+            }
+            Pop-Location
+          }
+          $count = (Get-ChildItem $builtPkgsDir -Filter *.nupkg).Count
+          Write-Host "Packed $count packages"
+          if ($count -eq 0) {
+            throw "No packages were built"
+          }
+
+      - name: Zip built packages
+        shell: pwsh
+        run: Compress-Archive -Path built_pkgs/*.nupkg -DestinationPath vm-packages.zip -Force
+
+      - name: Publish snapshot release
+        uses: svenstaro/upload-release-action@81c65b7cd4de9b2570615ce3aad67a41de5b1a13 # v2.11.2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: vm-packages.zip
+          tag: ${{ env.SNAPSHOT_TAG }}
+          overwrite: true
+          body: |
+            Auto-generated snapshot of the `.vm` Chocolatey wrapper packages, built directly
+            from [mandiant/VM-Packages](https://github.com/mandiant/VM-Packages) source
+            (commit `${{ steps.resolve.outputs.sha }}`) without going through myget.org.
+
+            `install.ps1` downloads this asset and installs from it first, falling back to
+            myget.org only for packages not yet in this snapshot. This release is
+            overwritten on every run and is not meant to be installed manually.

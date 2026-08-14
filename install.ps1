@@ -136,6 +136,32 @@ function Get-ConfigFile {
 $desktopPath = [Environment]::GetFolderPath("Desktop")
 Set-Location -Path $desktopPath -PassThru | Out-Null
 
+# Fetch a locally-built snapshot of the vm-packages so most installs don't depend on
+# myget.org being reachable. Best-effort: myget.org remains a fallback source below,
+# so a failed/missing snapshot just means every package resolves from myget as before.
+Write-Host "[+] Fetching local vm-packages snapshot..."
+$vmPackagesLocalDir = Join-Path $desktopPath "vm-packages-local"
+$vmPackagesSnapshotZip = Join-Path $desktopPath "vm-packages-snapshot.zip"
+$vmPackagesSnapshotUrl = "https://github.com/junyian/flare-vm/releases/download/vm-packages-snapshot/vm-packages.zip"
+# Always ensure the directory exists (even on failure below) so it's a valid, empty
+# chocolatey/nuget source rather than a missing path once it's added to the source lists
+New-Item -Path $vmPackagesLocalDir -ItemType directory -Force | Out-Null
+Save-FileFromUrl -fileSource $vmPackagesSnapshotUrl -fileDestination $vmPackagesSnapshotZip
+if (Test-Path $vmPackagesSnapshotZip) {
+    try {
+        # Clear out any stale nupkgs from a previous run before extracting the fresh snapshot
+        Remove-Item -Path (Join-Path $vmPackagesLocalDir "*.nupkg") -Force -ErrorAction SilentlyContinue
+        Expand-Archive -Path $vmPackagesSnapshotZip -DestinationPath $vmPackagesLocalDir -Force
+        Write-Host "`t[+] Extracted vm-packages snapshot to $vmPackagesLocalDir"
+    } catch {
+        Write-Host "`t[!] Failed to extract vm-packages snapshot, falling back to myget.org" -ForegroundColor Yellow
+    } finally {
+        Remove-Item -Path $vmPackagesSnapshotZip -Force -ErrorAction SilentlyContinue
+    }
+} else {
+    Write-Host "`t[!] vm-packages snapshot unavailable, falling back to myget.org" -ForegroundColor Yellow
+}
+
 # Setting global variables
 $script:checksPassed = $true
 $mandatoryChecksPassed = $true
@@ -1101,12 +1127,12 @@ $Boxstarter.NoPassword = $noPassword.IsPresent
 $Boxstarter.AutoLogin = $true
 $Boxstarter.SuppressLogging = $True
 $VerbosePreference = "SilentlyContinue"
-Set-BoxstarterConfig -NugetSources "$desktopPath;.;https://www.myget.org/F/vm-packages/api/v2;https://myget.org/F/vm-packages/api/v2;https://chocolatey.org/api/v2"
+Set-BoxstarterConfig -NugetSources "$vmPackagesLocalDir;$desktopPath;.;https://www.myget.org/F/vm-packages/api/v2;https://myget.org/F/vm-packages/api/v2;https://chocolatey.org/api/v2"
 Set-WindowsExplorerOptions -EnableShowHiddenFilesFoldersDrives -EnableShowProtectedOSFiles -EnableShowFileExtensions -EnableShowFullPathInTitleBar
 
 # Set Chocolatey options
 Write-Host "[+] Updating Chocolatey settings..."
-choco sources add -n="vm-packages" -s "$desktopPath;.;https://www.myget.org/F/vm-packages/api/v2;https://myget.org/F/vm-packages/api/v2" --priority 1
+choco sources add -n="vm-packages" -s "$vmPackagesLocalDir;$desktopPath;.;https://www.myget.org/F/vm-packages/api/v2;https://myget.org/F/vm-packages/api/v2" --priority 1
 choco feature enable -n allowGlobalConfirmation
 choco feature enable -n allowEmptyChecksums
 $cache = "${Env:LocalAppData}\ChocoCache"
@@ -1172,64 +1198,57 @@ function Get-Folder($textBox, $envVar) {
 	}
 }
 
-# Function that accesses MyGet vm-packages API URL to process packages that are the latest version and have a category
-# Saves vm-packages.xml into disk and follows the link after the </entry> tag to retrieve a new version of the XML file
+# Function that reads the nuspec embedded in each locally-built vm-packages snapshot
+# nupkg to process packages that have a category. Does not depend on myget.org: the
+# snapshot is downloaded ahead of time (see $vmPackagesLocalDir near the top of the script).
 # Returns $packagesByCategory, a hashtable of arrays, where each entry is a PSCustomObject
 function Get-Packages-Categories {
-   # MyGet API URL that contains a filter to display only the latest packages
-   # This URL displays the last two versions of a package
-   # Minimize the number of HTTP requests to display all the packages due to the number of versions a package might have
-   $vmPackagesUrl = "https://www.myget.org/F/vm-packages/api/v2/Packages?$filter=IsLatestVersion%20eq%20true"
-   $vmPackagesFile = "${Env:VM_COMMON_DIR}\vm-packages.xml"
-   $packagesByCategory=@{}
-   do {
-	  # Download the XML from MyGet API
-	  Save-FileFromUrl -fileSource $vmPackagesUrl -fileDestination $vmPackagesFile --exitOnError
+   $packagesByCategory = @{}
 
-	  # Load the XML content
-	  [xml]$vm_packages = Get-Content $vmPackagesFile
+   if (-not (Test-Path $vmPackagesLocalDir)) {
+      Write-Host "`t[!] No local vm-packages snapshot found, package browser will be empty" -ForegroundColor Yellow
+      return $packagesByCategory
+   }
 
-	  # Define the namespaces defined in vm-packages.xml to access nodes
-  # Each package resides in the entry node that is defined in the dataservices namespace
-	  # Each node has properties that are defined in the metadata namespace
-	  $ns = New-Object System.Xml.XmlNamespaceManager($vm_packages.NameTable)
-	  $ns.AddNamespace("atom", "http://www.w3.org/2005/Atom")
-	  $ns.AddNamespace("d", "http://schemas.microsoft.com/ado/2007/08/dataservices")
-	  $ns.AddNamespace("m", "http://schemas.microsoft.com/ado/2007/08/dataservices/metadata")
+   Add-Type -AssemblyName System.IO.Compression.FileSystem
+   $nupkgFiles = Get-ChildItem -Path $vmPackagesLocalDir -Filter *.nupkg -File
+   foreach ($nupkgFile in $nupkgFiles) {
+      $zip = $null
+      try {
+         # A nupkg is a zip archive containing a <id>.nuspec file at its root with the package metadata
+         $zip = [System.IO.Compression.ZipFile]::OpenRead($nupkgFile.FullName)
+         $nuspecEntry = $zip.Entries | Where-Object { $_.FullName -like "*.nuspec" } | Select-Object -First 1
+         if (-not $nuspecEntry) { continue }
 
-	  # Extract package information from the XML
-	  $vm_packages.feed.entry | ForEach-Object {
-		 $isLatestVersion = $_.SelectSingleNode("m:properties/d:IsLatestVersion", $ns).InnerText
-		 $category = $_.SelectSingleNode("m:properties/d:Tags", $ns).InnerText
-		 # Select only packages that have the latest version, contain a category and the category is not excluded
-		 if (($isLatestVersion -eq "true") -and ($category -ne "") -and ($excludedCategories -notcontains $category)) {
-	            $packageName = $_.properties.Id
-				$description = $_.properties.Description
-				$projectUrl = $_.properties.projectUrl
+         $reader = New-Object System.IO.StreamReader($nuspecEntry.Open())
+         [xml]$nuspec = $reader.ReadToEnd()
+         $reader.Close()
 
-				# Initialize category as an empty array
-				if (-not ($packagesByCategory.ContainsKey($category))) {
-					 $packagesByCategory[$category] = @()
-				}
-				$packageObject = [PSCustomObject]@{
-				PackageName        = $packageName
-				PackageDescription = $description
-				}
-				# Check if $projectUrl contains a valid URL
-				if ($projectUrl -match "^http") {
-					Add-Member -InputObject $packageObject -MemberType NoteProperty -Name "PackageUrl" -Value $projectURl
-				}
-				# Add the PackageName and PackageDescription (and PackageUrl if present) to each entry in the array
-				$packagesByCategory[$category] += $packageObject
+         $metadata = $nuspec.package.metadata
+         $category = $metadata.tags
+         # Select only packages that contain a category and the category is not excluded
+         if (($category) -and ($excludedCategories -notcontains $category)) {
+            # Initialize category as an empty array
+            if (-not ($packagesByCategory.ContainsKey($category))) {
+               $packagesByCategory[$category] = @()
             }
-		  }
-	  # Check if there is a next link in the XML and set the API URL to that link if it exists
-	  $nextLink = $vm_packages.SelectSingleNode("//atom:link[@rel='next']/@href", $ns)
-	  $vmPackagesUrl = $nextLink."#text"
+            $packageObject = [PSCustomObject]@{
+               PackageName        = $metadata.id
+               PackageDescription = $metadata.description
+            }
+            # Check if projectUrl contains a valid URL
+            if ($metadata.projectUrl -match "^http") {
+               Add-Member -InputObject $packageObject -MemberType NoteProperty -Name "PackageUrl" -Value $metadata.projectUrl
+            }
+            # Add the PackageName and PackageDescription (and PackageUrl if present) to each entry in the array
+            $packagesByCategory[$category] += $packageObject
+         }
+      } finally {
+         if ($zip) { $zip.Dispose() }
+      }
+   }
 
-   } while ($vmPackagesUrl)
-
-  return $packagesByCategory
+   return $packagesByCategory
 }
 
 # Function that returns an array of all the packages that are displayed sorted by category from $packagesByCategory
@@ -1415,6 +1434,25 @@ if (-not $noGui.IsPresent) {
 			if ($PackageName -notlike "*.vm") {
 				$PackageName = $PackageName + ".vm"
 			}
+
+			# Look for an exact match in the local vm-packages snapshot first (nupkgs are named
+			# <id>.<version>.nupkg), only falling back to a myget.org search if none is found
+			$localMatches = @()
+			if (Test-Path $vmPackagesLocalDir) {
+				$prefix = "$PackageName."
+				$localMatches = Get-ChildItem -Path $vmPackagesLocalDir -Filter "$PackageName.*.nupkg" -File |
+					Where-Object { $_.Name.StartsWith($prefix) } |
+					ForEach-Object {
+						New-Object -TypeName psobject -Property @{
+							'Name' = $PackageName
+							'Version' = $_.BaseName.Substring($prefix.Length)
+						}
+					}
+			}
+			if ($localMatches) {
+				return $localMatches
+			}
+
 			choco search $PackageName --exact -r -s "https://www.myget.org/F/vm-packages/api/v2" | ForEach-Object {
 				$Name, $Version = $_ -split '\|'
 				New-Object -TypeName psobject -Property @{
