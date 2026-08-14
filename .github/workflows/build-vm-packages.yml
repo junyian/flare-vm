@@ -11,7 +11,7 @@ name: Build vm-packages snapshot
 on:
   workflow_dispatch: # manual trigger, also used for the first snapshot
   schedule:
-    - cron: '0 6 * * *' # daily; note: disabled by default on forks until Actions/schedule is enabled
+    - cron: '0 6 * * 0' # weekly, Sunday 06:00 UTC; note: disabled by default on forks until Actions/schedule is enabled
 
 permissions:
   contents: write
