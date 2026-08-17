@@ -1127,12 +1127,29 @@ $Boxstarter.NoPassword = $noPassword.IsPresent
 $Boxstarter.AutoLogin = $true
 $Boxstarter.SuppressLogging = $True
 $VerbosePreference = "SilentlyContinue"
-Set-BoxstarterConfig -NugetSources "$vmPackagesLocalDir;$desktopPath;.;https://www.myget.org/F/vm-packages/api/v2;https://myget.org/F/vm-packages/api/v2;https://chocolatey.org/api/v2"
 Set-WindowsExplorerOptions -EnableShowHiddenFilesFoldersDrives -EnableShowProtectedOSFiles -EnableShowFileExtensions -EnableShowFullPathInTitleBar
 
 # Set Chocolatey options
 Write-Host "[+] Updating Chocolatey settings..."
-choco sources add -n="vm-packages" -s "$vmPackagesLocalDir;$desktopPath;.;https://www.myget.org/F/vm-packages/api/v2;https://myget.org/F/vm-packages/api/v2" --priority 1
+# Chocolatey (and Boxstarter, via the NugetSources config below) queries every source
+# in a source list on every install/upgrade - it does not stop at the first one that
+# has the package. So myget.org is deliberately left out of the default source list
+# here and only added back in (via -IncludeMyget) as a scoped retry when a package
+# turns out to be missing from the local snapshot, instead of being queried - and
+# possibly timing out - on every single package install.
+function Set-VMPackageSources {
+    param([switch]$IncludeMyget)
+
+    $sources = "$vmPackagesLocalDir;$desktopPath;."
+    if ($IncludeMyget) {
+        $sources = "$sources;https://www.myget.org/F/vm-packages/api/v2;https://myget.org/F/vm-packages/api/v2"
+    }
+
+    Set-BoxstarterConfig -NugetSources "$sources;https://chocolatey.org/api/v2"
+    choco sources remove -n="vm-packages" | Out-Null
+    choco sources add -n="vm-packages" -s "$sources" --priority 1 | Out-Null
+}
+Set-VMPackageSources
 choco feature enable -n allowGlobalConfirmation
 choco feature enable -n allowEmptyChecksums
 $cache = "${Env:LocalAppData}\ChocoCache"
@@ -1798,10 +1815,25 @@ foreach ($env in $configXml.config.envs.env) {
 }
 refreshenv
 
+# Installs a .vm package from the local snapshot, retrying against myget.org only if
+# that fails - e.g. the package is genuinely missing from the snapshot rather than
+# broken for an unrelated reason. See Set-VMPackageSources above.
+function Install-VMPackageWithFallback {
+    param([Parameter(Mandatory = $true)][string]$PackageName)
+
+    choco install $PackageName -y --force
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "`t[!] $PackageName failed to install from the local snapshot, retrying against myget.org..." -ForegroundColor Yellow
+        Set-VMPackageSources -IncludeMyget
+        choco install $PackageName -y --force
+        Set-VMPackageSources
+    }
+}
+
 # Install the common module
 # This creates all necessary folders based on custom environment variables
 Write-Host "[+] Installing shared module..."
-choco install common.vm -y --force
+Install-VMPackageWithFallback -PackageName "common.vm"
 refreshenv
 
 # Use single config
@@ -1825,7 +1857,7 @@ Import-Module "${Env:VM_COMMON_DIR}\vm.common\vm.common.psm1" -Force -DisableNam
 VM-Get-Host-Info
 
 Write-Host "[+] Installing the debloat.vm debloater and performance package"
-choco install debloat.vm -y --force
+Install-VMPackageWithFallback -PackageName "debloat.vm"
 
 # Download FLARE VM background image
 $backgroundImage = "${Env:VM_COMMON_DIR}\background.png"
@@ -1878,5 +1910,21 @@ if ($noPassword.IsPresent) {
     Install-BoxstarterPackage -packageName $PackageName
 } else {
     Install-BoxstarterPackage -packageName $PackageName -credential $credentials
+}
+
+# installer.vm installs every selected package itself, so packages missing from the
+# local snapshot land in lib-bad rather than surfacing here individually. Retry just
+# those against myget.org instead of having queried it for every package up front.
+$libBadDir = Join-Path "${Env:ChocolateyInstall}" "lib-bad"
+if (Test-Path $libBadDir) {
+    $failedPackages = Get-ChildItem -Path $libBadDir -Directory | Select-Object -ExpandProperty Name
+    if ($failedPackages) {
+        Write-Host "[+] Retrying $($failedPackages.Count) failed package(s) against myget.org..." -ForegroundColor Yellow
+        Set-VMPackageSources -IncludeMyget
+        foreach ($failedPackage in $failedPackages) {
+            choco install $failedPackage -y --force
+        }
+        Set-VMPackageSources
+    }
 }
 
